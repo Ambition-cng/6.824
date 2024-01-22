@@ -1,29 +1,26 @@
 package mr
 
-//
-// RPC definitions.
-//
-// remember to capitalize all names.
-//
+import (
+	"os"
+	"strconv"
+)
 
-import "os"
-import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
+type WorkerRequest struct {
+	WorkerState string // idle, mFinished, rFinished
+	TaskID      int
+	// idle: 等待被分配任务, TaskID == -1
+	// mFinished: 处理完成Map任务, 生成R个中间文件(intermediate/mr-TaskID-0,1,2,...,R-1)
+	// rFinished: 处理完成Reduce任务, 生成1个结果文件(mr-out-TaskID)
 }
 
-type ExampleReply struct {
-	Y int
+type MasterResponse struct {
+	TaskType          string // echo, map, reduce, finish
+	TaskID, FileCount int
+	InputFilePath     string
+	// echo: 暂无任务分配
+	// map: 分配第TaskID个Map任务给Worker, TaskID取值为0到M-1, FileCount == R,InputFilePath == pr-*.txt中的一个
+	// reduce: 分配第TaskID个Map任务给Worker, TaskID取值为0到R-1, FileCount == M,InputFilePath == intermediate/mr-*-TaskID, Reduce-Worker需要遍历所有满足以上格式的文件(M个)
 }
-
-// Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
