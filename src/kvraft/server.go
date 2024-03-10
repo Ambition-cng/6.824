@@ -4,13 +4,14 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"../labgob"
 	"../labrpc"
 	"../raft"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -26,11 +27,6 @@ type Op struct {
 	RequestIdentifier Identifier
 }
 
-type Record struct {
-	RequestId int
-	Reply     interface{}
-}
-
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -41,10 +37,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	cond         *sync.Cond
-	leaderId     int      // id of leader kvserver
-	commandIndex int      // index of highest command known to be executed
-	replyRecord  sync.Map // record of previous request, to ensure that the key/value service executes each one just once.
-	database     sync.Map // key-value database
+	leaderId     int               // id of leader kvserver
+	commandIndex int               // index of highest command known to be executed
+	replyRecord  map[int]int       // record of previous request, to ensure that the key/value service executes each one just once.
+	database     map[string]string // key-value database
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -67,7 +63,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		}
 
 		leaderId := kv.leaderId
-		val, exist := kv.database.Load(args.Key)
+		value, exist := kv.database[args.Key]
 		kv.mu.Unlock()
 		// ========== Lock Region ==========
 
@@ -78,7 +74,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				reply.Err = "ErrNoKey"
 				reply.Value = ""
 			} else {
-				value, _ := val.(string)
 				reply.Err = "OK"
 				reply.Value = value
 			}
@@ -89,16 +84,19 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	val, ok := kv.replyRecord.Load(args.Identifier.ClientId)
+	// ========== Lock Region ==========
+	kv.mu.Lock()
+	requestId, ok := kv.replyRecord[args.Identifier.ClientId]
 	if ok {
-		record, _ := val.(Record)
-		if record.RequestId == args.Identifier.RequestId {
-			putAppendReply, _ := record.Reply.(PutAppendReply)
-			reply.Err = putAppendReply.Err
-			reply.LeaderId = putAppendReply.LeaderId
+		if args.Identifier.RequestId == requestId {
+			reply.Err = "OK"
+			kv.mu.Unlock()
 			return
 		}
+		DPrintf("KvServer(%d) replyRecord of Client(%d) is %d, get new request %d\n", kv.me, args.Identifier.ClientId, requestId, args.Identifier.RequestId)
 	}
+	kv.mu.Unlock()
+	// ========== Lock Region ==========
 
 	reply.Err = "ErrWrongLeader"
 	reply.LeaderId = -1
@@ -172,11 +170,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.leaderId = -1
 	kv.commandIndex = 0
-	kv.database = sync.Map{}
-	kv.replyRecord = sync.Map{}
+	kv.database = make(map[string]string)
+	kv.replyRecord = make(map[int]int)
 	kv.cond = sync.NewCond(&kv.mu)
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go func() {
 		for m := range kv.applyCh {
@@ -184,66 +181,124 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				return
 			}
 
-			command, _ := m.Command.(Op)
-			identifier := command.RequestIdentifier
-			switch command.Operation {
-			case "Get":
-			case "Put":
-				lastRequest, ok := kv.replyRecord.Load(identifier.ClientId)
-				if ok {
-					record := lastRequest.(Record)
-					if record.RequestId == identifier.RequestId {
-						continue
-					}
-				}
+			if m.Snapshot == nil {
+				command, _ := m.Command.(Op)
+				identifier := command.RequestIdentifier
+				if command.Operation == "Get" {
+					// ========== Lock Region ==========
+					kv.mu.Lock()
 
-				kv.database.Store(command.Key, command.Value)
-				kv.replyRecord.Store(identifier.ClientId, Record{
-					RequestId: identifier.RequestId,
-					Reply: PutAppendReply{
-						Err:      "OK",
-						LeaderId: m.LeaderId,
-					},
-				})
-				DPrintf("Kvserver(%d) executed %s command(%s-%s) from client(%d) with index %d\n", kv.me, command.Operation, command.Key, command.Value, identifier.ClientId, identifier.RequestId)
-			case "Append":
-				lastRequest, ok := kv.replyRecord.Load(identifier.ClientId)
-				if ok {
-					record := lastRequest.(Record)
-					if record.RequestId == identifier.RequestId {
-						continue
-					}
-				}
+					kv.leaderId = m.LeaderId
+					kv.commandIndex = m.CommandIndex
+					kv.cond.Broadcast()
 
-				val, ok := kv.database.Load(command.Key)
-				if !ok {
-					kv.database.Store(command.Key, command.Value)
+					kv.mu.Unlock()
+					// ========== Lock Region ==========
 				} else {
-					value, _ := val.(string)
-					kv.database.Store(command.Key, value+command.Value)
+					// ========== Lock Region ==========
+					kv.mu.Lock()
+					lastRequestId, ok := kv.replyRecord[identifier.ClientId]
+					if ok {
+						if identifier.RequestId == lastRequestId {
+							kv.leaderId = m.LeaderId
+							kv.commandIndex = m.CommandIndex
+							kv.cond.Broadcast()
+							kv.mu.Unlock()
+							continue
+						}
+					}
+
+					if command.Operation == "Put" {
+						kv.database[command.Key] = command.Value
+						DPrintf("Kvserver(%d) executed %s command(%s-%s) from client(%d) with ClientRequestIndex %d\n", kv.me, command.Operation, command.Key, command.Value, identifier.ClientId, identifier.RequestId)
+					} else {
+						value, ok := kv.database[command.Key]
+						if !ok {
+							kv.database[command.Key] = command.Value
+						} else {
+							kv.database[command.Key] = value + command.Value
+						}
+						DPrintf("Kvserver(%d) executed %s command(%s-%s) from client(%d) with ClientRequestIndex %d\n", kv.me, command.Operation, command.Key, command.Value, identifier.ClientId, identifier.RequestId)
+					}
+
+					kv.leaderId = m.LeaderId
+					kv.commandIndex = m.CommandIndex
+					kv.cond.Broadcast()
+
+					kv.replyRecord[identifier.ClientId] = identifier.RequestId
+
+					kv.mu.Unlock()
+					// ========== Lock Region ==========
+				}
+			} else {
+				// ========== Lock Region ==========
+				kv.mu.Lock()
+				DPrintf("KvServer(%d) reconstruct from snapshot with index %d\n", kv.me, m.Snapshot.LastIncludedIndex)
+
+				kv.leaderId = m.LeaderId
+				kv.commandIndex = m.Snapshot.LastIncludedIndex
+
+				kv.database = make(map[string]string)
+				for key, value := range m.Snapshot.Database {
+					kv.database[key] = value
 				}
 
-				kv.replyRecord.Store(identifier.ClientId, Record{
-					RequestId: identifier.RequestId,
-					Reply: PutAppendReply{
-						Err:      "OK",
-						LeaderId: m.LeaderId,
-					},
-				})
-				DPrintf("Kvserver(%d) executed %s command(%s-%s) from client(%d) with index %d\n", kv.me, command.Operation, command.Key, command.Value, identifier.ClientId, identifier.RequestId)
-			default:
-				DPrintf("Error Command!\n")
+				kv.replyRecord = make(map[int]int)
+				for key, value := range m.Snapshot.ReplyRecord {
+					kv.replyRecord[key] = value
+				}
+
+				kv.mu.Unlock()
+				// ========== Lock Region ==========
+			}
+		}
+	}()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	go func() {
+		if kv.maxraftstate == -1 {
+			return
+		}
+
+		for {
+			if kv.killed() {
+				return
+			}
+
+			raftStateSize := persister.RaftStateSize()
+
+			if raftStateSize < kv.maxraftstate {
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
 
 			// ========== Lock Region ==========
 			kv.mu.Lock()
+			DPrintf("KvServer(%d) RaftStateSize(%d) over limit(%d), generate snapshot with index %d\n", kv.me, raftStateSize, kv.maxraftstate, kv.commandIndex)
 
-			kv.leaderId = m.LeaderId
-			kv.commandIndex = m.CommandIndex
-			kv.cond.Broadcast()
+			copiedDatabase := make(map[string]string)
+			for key, value := range kv.database {
+				copiedDatabase[key] = value
+			}
+
+			copiedReplyRecord := make(map[int]int)
+			for key, value := range kv.replyRecord {
+				copiedReplyRecord[key] = value
+			}
+
+			snapshot := raft.Snapshot{
+				LastIncludedIndex: kv.commandIndex,
+				Database:          copiedDatabase,
+				ReplyRecord:       copiedReplyRecord,
+			}
 
 			kv.mu.Unlock()
 			// ========== Lock Region ==========
+
+			kv.rf.Start(snapshot)
+
+			time.Sleep(50 * time.Millisecond)
 		}
 	}()
 
