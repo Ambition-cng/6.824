@@ -2,9 +2,11 @@ package shardmaster
 
 import (
 	"container/list"
-	"fmt"
+	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"../labgob"
 	"../labrpc"
@@ -15,7 +17,7 @@ const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		fmt.Printf(format, a...)
+		log.Printf(format, a...)
 	}
 	return
 }
@@ -27,10 +29,10 @@ type ShardMaster struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
-	cond         *sync.Cond
-	commandIndex int         // index of highest command known to be executed
-	replyRecord  map[int]int // record of previous request, to ensure that ShardMaster executes each request just once.
-	configs      []Config    // indexed by config num
+	commandIndex int                       // index of highest command known to be executed
+	replyChanMap map[int]chan CommandReply // used to receive replies for Join, Leave or Query commands, key - commandIndex, value - channel of reply
+	replyRecord  map[int]int               // record of previous request, to ensure that ShardMaster executes each request just once.
+	configs      []Config                  // indexed by config num
 
 	distribution map[int]*list.List // distribution of shards
 }
@@ -38,6 +40,15 @@ type ShardMaster struct {
 type Op struct {
 	Operation         interface{}
 	RequestIdentifier Identifier
+}
+
+type CommandReply struct {
+	Config Config
+}
+
+type DistributionEntry struct {
+	Gid     int
+	Replica *list.List
 }
 
 func (sm *ShardMaster) checkRepeatRequest(identifier Identifier) bool {
@@ -56,79 +67,104 @@ func (sm *ShardMaster) checkRepeatRequest(identifier Identifier) bool {
 }
 
 func (sm *ShardMaster) executeClientRequest(command Op) bool {
+	ret := false
+
 	index, term, is_leader := sm.rf.Start(command)
 	if is_leader {
+		replyChan := make(chan CommandReply, 1)
+		defer close(replyChan)
+
 		// ========== Lock Region ==========
 		sm.mu.Lock()
-		for sm.commandIndex < index {
-			sm.cond.Wait()
-		}
+		sm.replyChanMap[index] = replyChan
 		sm.mu.Unlock()
 		// ========== Lock Region ==========
 
-		checkTerm, checkLeader := sm.rf.GetState()
-		if checkTerm == term && checkLeader {
-			return true
+		// waiting raft executing command
+		select {
+		case <-replyChan:
+			checkTerm, checkLeader := sm.rf.GetState()
+
+			if checkTerm == term && checkLeader {
+				ret = true
+			}
+		case <-time.After(300 * time.Millisecond):
 		}
+
+		// ========== Lock Region ==========
+		sm.mu.Lock()
+		delete(sm.replyChanMap, index)
+		sm.mu.Unlock()
+		// ========== Lock Region ==========
 	}
-	return false
+
+	return ret
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
 	if sm.checkRepeatRequest(args.Identifier) {
 		reply.Err = "OK"
-		return
-	}
+	} else {
+		reply.WrongLeader = true
+		command := Op{
+			Operation:         args,
+			RequestIdentifier: args.Identifier,
+		}
 
-	reply.WrongLeader = true
-	command := Op{
-		Operation:         args,
-		RequestIdentifier: args.Identifier,
-	}
-
-	if sm.executeClientRequest(command) {
-		reply.WrongLeader = false
-		reply.Err = "OK"
+		if sm.executeClientRequest(command) {
+			reply.WrongLeader = false
+			reply.Err = "OK"
+		}
 	}
 }
 
 func (sm *ShardMaster) Leave(args *LeaveArgs, reply *LeaveReply) {
 	if sm.checkRepeatRequest(args.Identifier) {
 		reply.Err = "OK"
-		return
-	}
+	} else {
+		reply.WrongLeader = true
+		command := Op{
+			Operation:         args,
+			RequestIdentifier: args.Identifier,
+		}
 
-	reply.WrongLeader = true
-	command := Op{
-		Operation:         args,
-		RequestIdentifier: args.Identifier,
-	}
-
-	if sm.executeClientRequest(command) {
-		reply.WrongLeader = false
-		reply.Err = "OK"
+		if sm.executeClientRequest(command) {
+			reply.WrongLeader = false
+			reply.Err = "OK"
+		}
 	}
 }
 
 func (sm *ShardMaster) Move(args *MoveArgs, reply *MoveReply) {
 	if sm.checkRepeatRequest(args.Identifier) {
 		reply.Err = "OK"
-		return
-	}
+	} else {
+		reply.WrongLeader = true
+		command := Op{
+			Operation:         args,
+			RequestIdentifier: args.Identifier,
+		}
 
-	reply.WrongLeader = true
-	command := Op{
-		Operation:         args,
-		RequestIdentifier: args.Identifier,
-	}
-
-	if sm.executeClientRequest(command) {
-		reply.WrongLeader = false
-		reply.Err = "OK"
+		if sm.executeClientRequest(command) {
+			reply.WrongLeader = false
+			reply.Err = "OK"
+		}
 	}
 }
 
 func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
+	// ========== Lock Region ==========
+	sm.mu.Lock()
+	if args.Num != -1 && args.Num < len(sm.configs) {
+		reply.Config = sm.configs[args.Num]
+		reply.WrongLeader = false
+		reply.Err = "OK"
+		sm.mu.Unlock()
+		return
+	}
+	sm.mu.Unlock()
+	// ========== Lock Region ==========
+
 	reply.WrongLeader = true
 	command := Op{
 		Operation:         args,
@@ -137,27 +173,36 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 
 	index, term, is_leader := sm.rf.Start(command)
 	if is_leader {
+		replyChan := make(chan CommandReply, 1)
+		defer close(replyChan)
+
 		// ========== Lock Region ==========
 		sm.mu.Lock()
-		for sm.commandIndex < index {
-			sm.cond.Wait()
-		}
-
-		var config Config
-		if args.Num == -1 || args.Num >= len(sm.configs) {
-			config = sm.configs[len(sm.configs)-1]
-		} else {
-			config = sm.configs[args.Num]
-		}
+		sm.replyChanMap[index] = replyChan
 		sm.mu.Unlock()
 		// ========== Lock Region ==========
 
-		checkTerm, checkLeader := sm.rf.GetState()
-		if checkTerm == term && checkLeader {
-			reply.Config = config
-			reply.WrongLeader = false
+		// waiting raft executing command
+		select {
+		case serverReply := <-replyChan:
 			reply.Err = "OK"
+			reply.Config = serverReply.Config
+			reply.WrongLeader = false
+
+			checkTerm, checkLeader := sm.rf.GetState()
+
+			if checkTerm != term || !checkLeader {
+				reply.WrongLeader = true
+			}
+		case <-time.After(300 * time.Millisecond):
+			reply.WrongLeader = true
 		}
+
+		// ========== Lock Region ==========
+		sm.mu.Lock()
+		delete(sm.replyChanMap, index)
+		sm.mu.Unlock()
+		// ========== Lock Region ==========
 	}
 }
 
@@ -195,9 +240,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	labgob.Register(&QueryArgs{})
 
 	sm.commandIndex = 0
-	sm.applyCh = make(chan raft.ApplyMsg)
-	sm.cond = sync.NewCond(&sm.mu)
+	sm.applyCh = make(chan raft.ApplyMsg, 10)
 	sm.replyRecord = make(map[int]int)
+	sm.replyChanMap = make(map[int]chan CommandReply)
 	sm.distribution = make(map[int]*list.List)
 	sm.distribution[0] = list.New()
 	for i := 0; i < NShards; i++ {
@@ -206,113 +251,126 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	sm.rf = raft.Make(servers, me, persister, sm.applyCh)
 
-	go func() {
-		for m := range sm.applyCh {
-			if sm.killed() {
-				return
-			}
+	go sm.commandHandler()
+
+	return sm
+}
+
+func (sm *ShardMaster) commandHandler() {
+	// Lab 4B Test will not automatically call the Kill function of shardmaster, use noCommandCnt to check if test has ended
+	noCommandCnt := 0
+
+	for !sm.killed() {
+		select {
+		case m := <-sm.applyCh:
+			noCommandCnt = 0
+
+			// ========== Lock Region ==========
+			sm.mu.Lock()
 
 			command, _ := m.Command.(Op)
 			identifier := command.RequestIdentifier
 
-			if _, ok := command.Operation.(*QueryArgs); ok {
-				// ========== Lock Region ==========
-				sm.mu.Lock()
+			var reply CommandReply
+			if args, ok := command.Operation.(*QueryArgs); ok {
+				var config Config
+				if args.Num == -1 || args.Num >= len(sm.configs) {
+					config = sm.configs[len(sm.configs)-1]
+				} else {
+					config = sm.configs[args.Num]
+				}
 
-				sm.commandIndex = m.CommandIndex
-				sm.cond.Broadcast()
-
-				sm.mu.Unlock()
-				// ========== Lock Region ==========
+				reply.Config = config
 			} else {
-				// ========== Lock Region ==========
-				sm.mu.Lock()
-
-				lastRequestId, ok := sm.replyRecord[identifier.ClientId]
-				if ok {
-					if identifier.RequestId == lastRequestId {
-						sm.commandIndex = m.CommandIndex
-						sm.cond.Broadcast()
-						sm.mu.Unlock()
-						continue
-					}
-				}
-
-				var shards [NShards]int
-				lastConfig := sm.configs[len(sm.configs)-1]
-				num := lastConfig.Num + 1
-				group := make(map[int][]string, len(lastConfig.Groups))
-				for key, value := range lastConfig.Groups {
-					group[key] = value
-				}
-
-				switch args := command.Operation.(type) {
-				case *JoinArgs:
-					for key, value := range args.Servers {
+				lastRequestId, exist := sm.replyRecord[identifier.ClientId]
+				if exist && identifier.RequestId == lastRequestId {
+					DPrintf("ShardMaster(%d) received repeat command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
+				} else {
+					var shards [NShards]int
+					lastConfig := sm.configs[len(sm.configs)-1]
+					num := lastConfig.Num + 1
+					group := make(map[int][]string, len(lastConfig.Groups))
+					for key, value := range lastConfig.Groups {
 						group[key] = value
-						sm.distribution[key] = list.New()
 					}
 
-					if len(sm.distribution) > 1 { // in case of no valid replica
-						sm.loadBalance()
-					}
-					DPrintf("ShardMaster(%d) executed Join command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
-				case *LeaveArgs:
-					for _, gid := range args.GIDs {
-						for sm.distribution[gid].Len() != 0 {
-							moveShard(sm.distribution[0], sm.distribution[gid])
+					switch args := command.Operation.(type) {
+					case *JoinArgs:
+						for key, value := range args.Servers {
+							group[key] = value
+							sm.distribution[key] = list.New()
 						}
 
-						delete(sm.distribution, gid)
-						delete(group, gid)
+						if len(sm.distribution) > 1 { // in case of no valid replica
+							sm.loadBalance()
+						}
+						DPrintf("ShardMaster(%d) executed Join command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
+					case *LeaveArgs:
+						for _, gid := range args.GIDs {
+							for sm.distribution[gid].Len() != 0 {
+								moveShard(sm.distribution[0], sm.distribution[gid])
+							}
+
+							delete(sm.distribution, gid)
+							delete(group, gid)
+						}
+
+						if len(sm.distribution) > 1 { // in case of no valid replica
+							sm.loadBalance()
+						}
+						DPrintf("ShardMaster(%d) executed Leave command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
+					case *MoveArgs:
+						src := lastConfig.Shards[args.Shard]
+						for e := sm.distribution[src].Front(); e != nil; e = e.Next() {
+							if e.Value == args.Shard {
+								sm.distribution[src].MoveToBack(e)
+								break
+							}
+						}
+
+						moveShard(sm.distribution[args.GID], sm.distribution[src])
+
+						DPrintf("ShardMaster(%d) executed Move command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
+					default:
+						DPrintf("Error: unknown type\n")
 					}
 
-					if len(sm.distribution) > 1 { // in case of no valid replica
-						sm.loadBalance()
-					}
-					DPrintf("ShardMaster(%d) executed Leave command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
-				case *MoveArgs:
-					src := lastConfig.Shards[args.Shard]
-					for e := sm.distribution[src].Front(); e != nil; e = e.Next() {
-						if e.Value == args.Shard {
-							sm.distribution[src].MoveToBack(e)
-							break
+					// build shards from shard distribution
+					for key, value := range sm.distribution {
+						for e := value.Front(); e != nil; e = e.Next() {
+							index := e.Value.(int)
+							shards[index] = key
 						}
 					}
 
-					moveShard(sm.distribution[args.GID], sm.distribution[src])
+					sm.configs = append(sm.configs, Config{
+						Num:    num,
+						Shards: shards,
+						Groups: group,
+					})
+					DPrintf("Generate new configuration: %v\n", sm.configs[len(sm.configs)-1])
 
-					DPrintf("ShardMaster(%d) executed Move command from client(%d) with ClientRequestIndex %d\n", sm.me, identifier.ClientId, identifier.RequestId)
-				default:
-					DPrintf("Error: unknown type\n")
+					sm.replyRecord[identifier.ClientId] = identifier.RequestId
 				}
+			}
 
-				// build shards from shard distribution
-				for key, value := range sm.distribution {
-					for e := value.Front(); e != nil; e = e.Next() {
-						index := e.Value.(int)
-						shards[index] = key
-					}
-				}
+			sm.commandIndex = m.CommandIndex
+			replyChan, ok := sm.replyChanMap[m.CommandIndex]
+			if ok {
+				replyChan <- reply
+			}
 
-				sm.configs = append(sm.configs, Config{
-					Num:    num,
-					Shards: shards,
-					Groups: group,
-				})
-				DPrintf("Generate new configuration: %v\n", sm.configs[len(sm.configs)-1])
-
-				sm.commandIndex = m.CommandIndex
-				sm.replyRecord[identifier.ClientId] = identifier.RequestId
-				sm.cond.Broadcast()
-
-				sm.mu.Unlock()
-				// ========== Lock Region ==========
+			sm.mu.Unlock()
+			// ========== Lock Region ==========
+		case <-time.After(1000 * time.Millisecond):
+			if noCommandCnt < 5 {
+				DPrintf("ShardMaster(%d) has been waiting for command for more than one second, noCommandCnt: %d\n", sm.me, noCommandCnt)
+				noCommandCnt++
+			} else {
+				sm.Kill()
 			}
 		}
-	}()
-
-	return sm
+	}
 }
 
 // move shard from src replica to dst replica
@@ -323,31 +381,37 @@ func moveShard(dst *list.List, src *list.List) {
 
 // move shard between replicas to reach load-balance
 func (sm *ShardMaster) loadBalance() {
-	// compute the balanced load
-	balance := NShards / (len(sm.distribution) - 1)
+	// make each traversal orderly
+	var entries []DistributionEntry
+	for key, value := range sm.distribution {
+		entries = append(entries, DistributionEntry{Gid: key, Replica: value})
+	}
 
-	// if there is no valid replica before, move all shards to a random replica, which will enter highLoadReplica slice
-	if sm.distribution[0].Len() != 0 {
-		for key := range sm.distribution {
-			if key != 0 {
-				for sm.distribution[0].Len() != 0 {
-					moveShard(sm.distribution[key], sm.distribution[0])
-				}
-				break
-			}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Gid < entries[j].Gid
+	})
+
+	// compute the balanced load
+	balance := NShards / (len(entries) - 1)
+
+	// if there is no valid replica before, move all shards to the replica with the max gid, which will then enter highLoadReplica slice
+	// assuming that each gid is greater than 0, it doesn't matter
+	if entries[0].Replica.Len() != 0 && len(entries) > 1 {
+		for entries[0].Replica.Len() != 0 {
+			moveShard(entries[1].Replica, entries[0].Replica)
 		}
 	}
 
 	lowLoadReplica, highLoadReplica := make([]*list.List, 0), make([]*list.List, 0)
-	for key, value := range sm.distribution {
-		if key == 0 {
+	for _, entry := range entries {
+		if entry.Gid == 0 {
 			continue
 		}
 
-		if value.Len() < balance {
-			lowLoadReplica = append(lowLoadReplica, value)
-		} else if value.Len() > balance {
-			highLoadReplica = append(highLoadReplica, value)
+		if entry.Replica.Len() < balance {
+			lowLoadReplica = append(lowLoadReplica, entry.Replica)
+		} else if entry.Replica.Len() > balance {
+			highLoadReplica = append(highLoadReplica, entry.Replica)
 		}
 	}
 

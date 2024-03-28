@@ -48,10 +48,9 @@ type ApplyMsg struct {
 }
 
 type Snapshot struct {
-	LastIncludedIndex int               // index of the last entry in the log that the snapshot replaces (the last entry that the state machine had applied)
-	LastIncludedTerm  int               // term of lastIncludedIndex
-	Database          map[string]string // state machine state
-	ReplyRecord       map[int]int       // client request record
+	LastIncludedIndex int // index of the last entry in the log that the snapshot replaces (the last entry that the state machine had applied)
+	LastIncludedTerm  int // term of lastIncludedIndex
+	ServerSnapshot    interface{}
 }
 
 type Entry struct {
@@ -401,8 +400,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapshot = &Snapshot{
 			LastIncludedIndex: args.LastIncludedIndex,
 			LastIncludedTerm:  args.LastIncludedTerm,
-			Database:          args.Database,
-			ReplyRecord:       args.ReplyRecord,
+			ServerSnapshot:    args.ServerSnapshot,
 		}
 		rf.persist()
 
@@ -645,10 +643,9 @@ func (rf *Raft) initiateLeaderElection(currentTerm int) {
 	replyCh := make(chan int, peerNum)
 	voteGranted := 1
 
-	replies := []RequestVoteReply{}
+	replies := make([]RequestVoteReply, peerNum)
 
 	for id := 0; id < peerNum; id++ {
-		replies = append(replies, RequestVoteReply{})
 		if id == rf.me {
 			continue
 		}
@@ -779,8 +776,7 @@ func (rf *Raft) sendLogEntries(currentTerm int) {
 				Snapshot: Snapshot{
 					LastIncludedIndex: rf.snapshot.LastIncludedIndex,
 					LastIncludedTerm:  rf.snapshot.LastIncludedTerm,
-					Database:          rf.snapshot.Database,
-					ReplyRecord:       rf.snapshot.ReplyRecord,
+					ServerSnapshot:    rf.snapshot.ServerSnapshot,
 				},
 			}
 
@@ -807,7 +803,8 @@ func (rf *Raft) sendLogEntries(currentTerm int) {
 			}
 
 			if lastLogIndex >= rf.nextIndex[id] {
-				args.Entries = rf.log[rf.nextIndex[id]-rf.logOffset:]
+				args.Entries = make([]Entry, len(rf.log[rf.nextIndex[id]-rf.logOffset:]))
+				copy(args.Entries, rf.log[rf.nextIndex[id]-rf.logOffset:])
 
 				DPrintf("leader(%d) sending AppendEntries to server %d in term %d : prevLogIndex - %d; prevLogTerm - %d; nextIndex - %d; lastLogIndex - %d; leaderCommit - %d;\n", rf.me, id, currentTerm, prevLogIndex, prevLogTerm, rf.nextIndex[id], lastLogIndex, rf.commitIndex)
 			}
